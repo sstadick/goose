@@ -172,6 +172,29 @@ A program that calls only these functions compiles and links no native code and
 can run with `goose run` without a C toolchain. The rest of this section covers
 packages that compile their own C.
 
+For small adapters that should be visible to the C optimizer, a package can
+instead include headers in the consumer's generated C:
+
+```goose
+// mylib.build
+c_headers = ["include/adapters.h"];
+```
+
+Paths are relative to the package root (or the program's directory for its
+own sidecar). Like `--include`, these headers follow the generated Goose types
+and precede extern prototypes and function bodies. A header can define
+`static inline` implementations of ordinary `extern fn` declarations, using
+the generated types, without a separate object file or consumer `--include`.
+Types from optional Goose modules that were not imported are not available.
+Headers must support the selected C backend, including TinyCC for `goose run`;
+listing headers alone does not require an external C toolchain for that mode.
+
+`c_headers` takes the same platform suffixes as the other `c_*` lists. Headers
+are included in list order: command-line `--include` entries, the program's
+sidecar, then packages in load order. Headers should include their own
+dependencies; `c_include`, `c_defines` and `c_flags_*` still apply only to the
+separately compiled native sources, not the consumer's generated C.
+
 The sidecar names the C in one of two ways. The first is plain sources,
 which the compiler compiles with the given includes, defines, flags and
 libraries:
