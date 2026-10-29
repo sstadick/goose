@@ -1,4 +1,7 @@
 """Included C adapters can use every declared extern's types, even when unused."""
+import os
+import subprocess
+import tempfile
 from pathlib import Path
 
 import toolchain as tc
@@ -66,3 +69,65 @@ static int64_t adapter_length(sl_f64 values) { return values.len; }
                 check([binary])
             if jit:
                 check([exe, *flags, "--jit", source])
+
+    # The same adapters supplied by a package, with no --include for them.
+    # Run outside the source tree and emit into a third directory so paths
+    # accidentally resolved against cwd or the generated C cannot work.
+    with tempfile.TemporaryDirectory(prefix="headers-", dir=base) as tmp:
+        root = Path(tmp)
+        pkg = root / "adapter package"
+        pkg.mkdir()
+        output = root / "output"
+        output.mkdir()
+        tc.write_text(pkg / "adapter.goose", (base / "adapter.goose").read_text())
+        adapter = pkg / "adapter.h"
+        tc.write_text(adapter, header.read_text())
+        tc.write_text(pkg / "adapter.build", 'c_headers = ["adapter.h"];\n')
+        source = root / "app.goose"
+        tc.write_text(source, 'import adapter from "./adapter package";\n'
+                      'extern fn platform_value() -> i32;\n'
+                      'extern fn cli_value() -> i32;\n'
+                      'fn main() {\nlet x = Input { [20, 22] }; assert(input(x) == 42);'
+                      '\nprint(result().value + platform_value() + cli_value());\n}\n')
+        tc.write_text(root / "common.h", '#define HEADER_OFFSET 3\n')
+        tc.write_text(root / "platform.h",
+                      'static int32_t platform_value(void) { return HEADER_OFFSET; }\n')
+        cli = root / "cli.h"
+        tc.write_text(cli, 'static int32_t cli_value(void) { return 5; }\n')
+        platform = "windows" if tc.IS_WINDOWS else "macos" if tc.IS_MACOS else "linux"
+        tc.write_text(root / "app.build", 'c_headers = ["common.h"];\n' + ''.join(
+            f'c_headers_{p} = ["{"platform.h" if p == platform else "missing.h"}"];\n'
+            for p in ("windows", "macos", "linux")))
+        env = dict(os.environ, GOOSE_HOME=str(root / "home"))
+
+        def expect(command, want=None, *, no_toolchain=False):
+            runenv = dict(env, PATH="", CC="", CXX="") if no_toolchain else env
+            r = subprocess.run([str(a) for a in command], cwd=output, env=runenv,
+                               capture_output=True, text=True, errors="replace", timeout=600)
+            if r.returncode or tc.sanitizer_failure(r.stderr) or (
+                    want is not None and r.stdout.strip() != want):
+                raise RuntimeError(f"package headers: {command}:\n{r.stdout}{r.stderr}")
+
+        flags = ["--include", cli]
+        if jit:
+            expect([exe, "run", *flags, source], "50", no_toolchain=True)
+        if cc:
+            binary = output / ("app" + tc.EXE_SUFFIX)
+            expect([exe, "build", "--cc", cc.cc, *flags, "-o", binary, source])
+            expect([binary], "50")
+            cfile = output / "app.c"
+            expect([exe, *flags, "-o", cfile, source])
+            ok, log = cc.compile(cfile, binary, opt=2 if not extra else 1,
+                                 extra=extra, strict_decls=True, runtime=runtime)
+            if not ok:
+                raise RuntimeError(f"package header emitted C:\n{log}")
+            expect([binary], "50")
+            # A header-only package must not leave stale code in a native cache.
+            tc.write_text(adapter, header.read_text().replace("{ 42 }", "{ 61 }"))
+            expect([exe, "build", "--cc", cc.cc, *flags, "-o", binary, source])
+            expect([binary], "69")
+        # Even with no live extern calls, the header's generated types exist.
+        tc.write_text(source, 'import adapter from "./adapter package";\n'
+                      'fn main() { print("unused"); }\n')
+        if jit:
+            expect([exe, "run", source], "unused", no_toolchain=True)
